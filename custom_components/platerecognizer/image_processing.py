@@ -4,6 +4,7 @@ import requests
 import voluptuous as vol
 import re
 import io
+import time
 from typing import List, Dict
 import json
 
@@ -27,6 +28,7 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATE_READER_URL = "https://api.platerecognizer.com/v1/plate-reader/"
 STATS_URL = "https://api.platerecognizer.com/v1/statistics/"
+REQUEST_TIMEOUT = 30
 
 EVENT_VEHICLE_DETECTED = "platerecognizer.vehicle_detected"
 
@@ -100,7 +102,8 @@ def get_orientations(results : List[Dict]) -> List[str]:
                     orientations.append(cand["orientation"])
         return list(set(orientations))
     except Exception as exc:
-        _LOGGER.error("get_orientations error: %s", exc)
+        _LOGGER.error("Could not extract vehicle orientations: %s", exc, exc_info=True)
+        return []
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the platform."""
@@ -167,7 +170,7 @@ class PlateRecognizerEntity(ImageProcessingEntity):
         self._region_strict = region_strict
         self._state = None
         self._results = {}
-        self._vehicles = [{}]
+        self._vehicles = []
         self._orientations = []
         self._plates = []
         self._statistics = {}
@@ -176,35 +179,94 @@ class PlateRecognizerEntity(ImageProcessingEntity):
         self._image_height = None
         self._image = None
         self._config = {}
-        self.get_statistics()
+        _LOGGER.debug(
+            "Configured Plate Recognizer entity %s (server=%s, regions=%s, mmc=%s)",
+            self._name,
+            self._server,
+            self._regions,
+            self._mmc,
+        )
+        if self._server == PLATE_READER_URL:
+            self.get_statistics()
+        else:
+            _LOGGER.debug(
+                "Skipping cloud statistics request for local Plate Recognizer server %s",
+                self._server,
+            )
 
     def process_image(self, image):
         """Process an image."""
         self._state = None
         self._results = {}
-        self._vehicles = [{}]
+        self._vehicles = []
         self._plates = []
         self._orientations = []
-        self._image = Image.open(io.BytesIO(bytearray(image)))
-        self._image_width, self._image_height = self._image.size
-        
+        try:
+            self._image = Image.open(io.BytesIO(bytearray(image)))
+            self._image_width, self._image_height = self._image.size
+        except (UnidentifiedImageError, OSError, TypeError) as exc:
+            _LOGGER.error(
+                "Could not read image for Plate Recognizer entity %s: %s",
+                self._name,
+                exc,
+            )
+            self._state = 0
+            return
+
         if self._regions == DEFAULT_REGIONS:
             regions = None
         else:
             regions = self._regions
+        self._config = {}
         if self._detection_rule:
             self._config.update({"detection_rule" : self._detection_rule})
         if self._region_strict:
             self._config.update({"region": self._region_strict})
+
+        request_started = time.monotonic()
+        response = None
         try:
-            _LOGGER.debug("Config: " + str(json.dumps(self._config)))
-            response = requests.post(
-                self._server, 
-                data=dict(regions=regions, camera_id=self.name, mmc=self._mmc, config=json.dumps(self._config)),  
-                files={"upload": image}, 
-                headers=self._headers
-            ).json()
+            _LOGGER.debug(
+                "Submitting Plate Recognizer request (entity=%s, server=%s, image=%dx%d, "
+                "image_bytes=%d, regions=%s, mmc=%s, config=%s)",
+                self._name,
+                self._server,
+                self._image_width,
+                self._image_height,
+                len(image),
+                regions,
+                self._mmc,
+                self._config,
+            )
+            api_response = requests.post(
+                self._server,
+                data=dict(regions=regions, camera_id=self.name, mmc=self._mmc, config=json.dumps(self._config)),
+                files={"upload": image},
+                headers=self._headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            _LOGGER.debug(
+                "Plate Recognizer response received (entity=%s, status=%s, content_type=%s, "
+                "response_bytes=%d, duration=%.2fs)",
+                self._name,
+                api_response.status_code,
+                api_response.headers.get("Content-Type", "unknown"),
+                len(api_response.content),
+                time.monotonic() - request_started,
+            )
+            api_response.raise_for_status()
+            response = api_response.json()
+            if not isinstance(response, dict):
+                raise ValueError("API response is not a JSON object")
+            if "results" not in response or not isinstance(response["results"], list):
+                raise ValueError("API response does not contain a results list")
+
             self._results = response["results"]
+            _LOGGER.debug(
+                "Plate Recognizer processed response for entity %s: %d result(s)",
+                self._name,
+                len(self._results),
+            )
             self._plates = get_plates(response['results'])
             if self._mmc:
                 self._orientations = get_orientations(response['results'])
@@ -219,9 +281,36 @@ class PlateRecognizerEntity(ImageProcessingEntity):
                 }
                 for r in self._results
             ]
-        except Exception as exc:
-            _LOGGER.error("platerecognizer error: %s", exc)
-            _LOGGER.error(f"platerecognizer api response: {response}")
+        except requests.RequestException as exc:
+            self._results = []
+            self._plates = []
+            self._orientations = []
+            self._vehicles = []
+            status_code = exc.response.status_code if exc.response is not None else "no response"
+            error_detail = ""
+            if exc.response is not None:
+                error_detail = exc.response.text[:500].replace("\n", " ")
+            _LOGGER.error(
+                "Plate Recognizer request failed for entity %s (status=%s, duration=%.2fs): %s%s",
+                self._name,
+                status_code,
+                time.monotonic() - request_started,
+                exc,
+                f"; API detail: {error_detail}" if error_detail else "",
+            )
+            _LOGGER.debug("Plate Recognizer request exception details", exc_info=True)
+        except (ValueError, KeyError, TypeError) as exc:
+            self._results = []
+            self._plates = []
+            self._orientations = []
+            self._vehicles = []
+            _LOGGER.error(
+                "Invalid Plate Recognizer response for entity %s after %.2fs: %s",
+                self._name,
+                time.monotonic() - request_started,
+                exc,
+            )
+            _LOGGER.debug("Plate Recognizer response parsing details", exc_info=True)
 
         self._state = len(self._vehicles)
         if self._state > 0:
@@ -234,19 +323,46 @@ class PlateRecognizerEntity(ImageProcessingEntity):
         if self._server == PLATE_READER_URL:
             self.get_statistics()
         else:
-            stats = response["usage"]
-            calls_remaining = stats["max_calls"] - stats["calls"]
-            stats.update({"calls_remaining": calls_remaining})
-            self._statistics = stats
+            stats = response.get("usage") if isinstance(response, dict) else None
+            if isinstance(stats, dict) and {"max_calls", "calls"}.issubset(stats):
+                calls_remaining = stats["max_calls"] - stats["calls"]
+                stats.update({"calls_remaining": calls_remaining})
+                self._statistics = stats
+                _LOGGER.debug(
+                    "Local Plate Recognizer usage for entity %s: %s calls remaining",
+                    self._name,
+                    calls_remaining,
+                )
+            elif response is not None:
+                _LOGGER.debug(
+                    "Local Plate Recognizer response for entity %s contains no usage statistics",
+                    self._name,
+                )
 
     def get_statistics(self):
         try:
-            response = requests.get(STATS_URL, headers=self._headers).json()
+            request_started = time.monotonic()
+            _LOGGER.debug("Requesting Plate Recognizer account statistics for entity %s", self._name)
+            api_response = requests.get(STATS_URL, headers=self._headers, timeout=REQUEST_TIMEOUT)
+            _LOGGER.debug(
+                "Plate Recognizer statistics response received (entity=%s, status=%s, duration=%.2fs)",
+                self._name,
+                api_response.status_code,
+                time.monotonic() - request_started,
+            )
+            api_response.raise_for_status()
+            response = api_response.json()
             calls_remaining = response["total_calls"] - response["usage"]["calls"]
             response.update({"calls_remaining": calls_remaining})
             self._statistics = response.copy()
-        except Exception as exc:
-            _LOGGER.error("platerecognizer error getting statistics: %s", exc)
+            _LOGGER.debug(
+                "Plate Recognizer account statistics updated for entity %s: %s calls remaining",
+                self._name,
+                calls_remaining,
+            )
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            _LOGGER.error("Could not get Plate Recognizer statistics for entity %s: %s", self._name, exc)
+            _LOGGER.debug("Plate Recognizer statistics exception details", exc_info=True)
 
     def fire_vehicle_detected_event(self, vehicle):
         """Send event."""
